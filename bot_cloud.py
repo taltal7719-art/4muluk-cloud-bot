@@ -228,23 +228,18 @@ async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === MAIN ===
 
-async def run_bot():
+def main():
+    # health-server запускаем в отдельном потоке
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    # Telegram-бот в основном потоке: run_polling сам управляет event loop
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("day", day_cmd))
 
     logger.info("Запускаю Telegram-бота 4 Muluk в облаке...")
-    await app.run_polling(close_loop=False)
-
-
-def main():
-    # health-server запускаем в отдельном потоке
-    threading.Thread(target=run_health_server, daemon=True).start()
-
-    # Telegram-бот — в основном потоке (asyncio)
-    import asyncio
-    asyncio.run(run_bot())
+    app.run_polling()
 
 
 if __name__ == "__main__":
