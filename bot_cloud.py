@@ -10,7 +10,7 @@
 
 Бот:
 - сам считает энергетику дня через mayan_logic.py
-- раз в сутки может слать утренний отчёт владельцу (OWNER_CHAT_ID)
+- умеет (если доступен JobQueue) раз в сутки слать утренний отчёт владельцу (OWNER_CHAT_ID)
 - на Koyeb держит health-сервер на порту 8000 (для проверки живости)
 """
 
@@ -18,7 +18,7 @@ import os
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -46,17 +46,17 @@ try:
     BISHKEK_TZ = ZoneInfo("Asia/Bishkek")
 except Exception:
     # Запасной вариант, если вдруг нет таймзоны в образе
-    from datetime import timedelta, timezone
+    from datetime import timezone
     BISHKEK_TZ = timezone(timedelta(hours=6))
 
-# Токен берём из переменных окружения (как мы и сделали на Koyeb)
+# Токен берём из переменных окружения (как на Koyeb)
 BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN")
     or os.getenv("BOT_TOKEN")
     or os.getenv("TOKEN")
 )
 
-# Чат, куда слать утренний отчёт (можно задать в Koyeb как OWNER_CHAT_ID="635079110")
+# Чат, куда слать утренний отчёт (например, OWNER_CHAT_ID="635079110")
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
 
 
@@ -176,7 +176,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/day YYYY-MM-DD — отчёт на конкретную дату\n"
         "/morning_test — показать, как будет выглядеть утренний отчёт\n\n"
         "Утренний автоотчёт раз в сутки:\n"
-        "- время задаём в коде (сейчас 06:00 по Бишкеку)\n"
+        "- время задаём в коде (по умолчанию 06:00 по Бишкеку)\n"
         "- чат для автоотчёта — через переменную окружения OWNER_CHAT_ID."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -219,7 +219,7 @@ async def morning_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# --- УТРЕННЕЕ ЗАДАНИЕ ДЛЯ JOB QUEUE --- #
+# --- УТРЕННЕЕ ЗАДАНИЕ ДЛЯ JOB QUEUE (если доступен) --- #
 
 async def morning_job(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -269,13 +269,20 @@ def main():
     app.add_handler(CommandHandler("day", day_cmd))
     app.add_handler(CommandHandler("morning_test", morning_test_cmd))
 
-    # Утренняя задача (каждый день в 06:00 по Бишкеку)
-    run_time = time(hour=6, minute=0, tzinfo=BISHKEK_TZ)
-    app.job_queue.run_daily(
-        morning_job,
-        time=run_time,
-        name="morning_report_4muluk",
-    )
+    # Утренняя задача (если JobQueue доступен)
+    if app.job_queue is None:
+        logger.warning(
+            "JobQueue недоступен (нет зависимости 'python-telegram-bot[job-queue]'). "
+            "Утренний автоотчёт отключён, но команды /day и /morning_test работают."
+        )
+    else:
+        run_time = time(hour=6, minute=0, tzinfo=BISHKEK_TZ)
+        app.job_queue.run_daily(
+            morning_job,
+            time=run_time,
+            name="morning_report_4muluk",
+        )
+        logger.info("Утренняя задача успешно зарегистрирована в JobQueue.")
 
     # Запуск бота (polling)
     app.run_polling()
