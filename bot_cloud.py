@@ -1,19 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Облачный Telegram-бот 4 Muluk для Koyeb.
+Облачный Telegram-бот для Системы 4 Muluk.
 
-Особенности:
-- Берёт BOT_TOKEN из переменной окружения.
-- Считает энергетику дня напрямую через mayan_logic (без локального API).
-- Поднимает простой HTTP-сервер на порту $PORT для health-check Koyeb.
+Команды:
+  /start          — приветствие и подсказка по командам
+  /day            — отчёт на сегодня
+  /day YYYY-MM-DD — отчёт на указанную дату
+  /morning_test   — "утренний отчёт" прямо сейчас (как будет приходить утром)
+
+Бот:
+- сам считает энергетику дня через mayan_logic.py
+- раз в сутки может слать утренний отчёт владельцу (OWNER_CHAT_ID)
+- на Koyeb держит health-сервер на порту 8000 (для проверки живости)
 """
 
-import logging
 import os
+import logging
 import threading
-import http.server
-import socketserver
-from datetime import datetime, date
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.ext import (
@@ -24,31 +30,35 @@ from telegram.ext import (
 
 from mayan_logic import (
     mayan_from_gregorian,
+    get_moon_phase,
     classify_day,
     get_deep_profile,
-    get_moon_phase,
     get_crowd_state,
     get_bot_mode,
     get_biorhythms,
     get_training_recommendation,
-    get_daily_schedule,
-    get_nutrition_profile,
-    get_sumerian_profile,
-    get_eastern_profile,
 )
 
-# === НАСТРОЙКИ ===
+# --- НАСТРОЙКИ ПРОФИЛЯ 4 MULUK --- #
 
-# дата рождения 4 Muluk
 BIRTH_DATE = date(1972, 11, 10)
+try:
+    BISHKEK_TZ = ZoneInfo("Asia/Bishkek")
+except Exception:
+    # Запасной вариант, если вдруг нет таймзоны в образе
+    from datetime import timedelta, timezone
+    BISHKEK_TZ = timezone(timedelta(hours=6))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Токен берём из переменных окружения (как мы и сделали на Koyeb)
+BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("BOT_TOKEN")
+    or os.getenv("TOKEN")
+)
 
-if not BOT_TOKEN:
-    raise SystemExit("Переменная окружения BOT_TOKEN не задана. Задай её в настройках Koyeb.")
+# Чат, куда слать утренний отчёт (можно задать в Koyeb как OWNER_CHAT_ID="635079110")
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
 
-
-# === ЛОГИРОВАНИЕ ===
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -57,188 +67,217 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# === HEALTH-CHECK HTTP-СЕРВЕР ДЛЯ KOYEB ===
+# --- HEALTH-СЕРВЕР ДЛЯ KOYEB (порт 8000) --- #
 
-def run_health_server():
-    """
-    Простейший HTTP-сервер, который отвечает 200 OK на любой запрос.
-    Нужен только для health-check Koyeb (порт 8000 или $PORT).
-    """
-    port = int(os.getenv("PORT", "8000"))
-
-    class Handler(http.server.BaseHTTPRequestHandler):
+def start_health_server():
+    class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
             self.end_headers()
             self.wfile.write(b"OK")
 
         def log_message(self, format, *args):
-            # глушим болтливый лог http-сервера
+            # Глушим стандартный треск HTTPServer в логах
             return
 
-    with socketserver.TCPServer(("", port), Handler) as httpd:
-        logger.info("Health server запущен на порту %s", port)
-        httpd.serve_forever()
+    server = HTTPServer(("0.0.0.0", 8000), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health server запущен на порту 8000")
 
 
-# === ВСПОМОГАТЕЛЬНАЯ ЛОГИКА ===
+# --- ЛОГИКА ОТЧЁТА О ДНЕ --- #
 
-def compute_day_payload(d: date) -> dict:
-    """
-    Собираем полный профиль дня (примерно как /api/day в локальной версии).
-    """
-    info = mayan_from_gregorian(d)
-    moon = get_moon_phase(d)
+def build_day_data(target_date: date) -> dict:
+    info = mayan_from_gregorian(target_date)
+    moon = get_moon_phase(target_date)
     cls = classify_day(info["tz_number"], info["tz_name"], moon["phase_code"])
     deep = get_deep_profile(info["tz_number"], info["tz_name"], moon["phase_code"])
-    crowd_state = get_crowd_state(info["tz_number"], info["tz_name"], moon["phase_code"])
-    bot_mode = get_bot_mode(cls["trading_signal_label"], crowd_state["code"])
+    crowd = get_crowd_state(info["tz_number"], info["tz_name"], moon["phase_code"])
+    bot_mode = get_bot_mode(cls["trading_signal_label"], crowd["code"])
 
-    bior = get_biorhythms(BIRTH_DATE, d)
+    bior = get_biorhythms(BIRTH_DATE, target_date)
     training = get_training_recommendation(bior, cls, moon["phase_code"])
-    schedule = get_daily_schedule(BIRTH_DATE, d, cls, moon["phase_code"], bior)
-    nutrition = get_nutrition_profile(bior, cls, moon["phase_code"])
-    sumer = get_sumerian_profile(d)
-    east = get_eastern_profile(d)
 
     return {
-        "date": d.isoformat(),
-        "tzolkin": {
-            "number": info["tz_number"],
-            "name": info["tz_name"],
-        },
-        "haab": {
-            "day": info["haab_day"],
-            "month": info["haab_month_name"],
-        },
-        "moon": {
-            "phase_code": moon["phase_code"],
-            "phase_name": moon["phase_name"],
-            "age": moon["age"],
-            "illum": moon["illum"],
-        },
-        "class": {
-            "level": cls["level"],
-            "label": cls["label"],
-            "description": cls["description"],
-            "trading_signal_label": cls["trading_signal_label"],
-            "trading_signal_description": cls["trading_signal_description"],
-        },
-        "crowd": {
-            "scenario": deep["crowd_scenario"],
-            "state": crowd_state["code"],
-            "state_label": crowd_state["label"],
-            "state_description": crowd_state["description"],
-        },
-        "bot_mode": {
-            "code": bot_mode["code"],
-            "label": bot_mode["label"],
-            "description": bot_mode["description"],
-        },
-        "biorhythms": bior,
+        "date": target_date,
+        "info": info,
+        "moon": moon,
+        "cls": cls,
+        "deep": deep,
+        "crowd": crowd,
+        "bot_mode": bot_mode,
+        "bior": bior,
         "training": training,
-        "schedule": schedule,
-        "nutrition": nutrition,
-        "sumerian": sumer,
-        "eastern": east,
     }
 
 
-def format_day_message(payload: dict) -> str:
-    """
-    Формируем красивый текст для Telegram из payload.
-    """
-    d = payload["date"]
-    tz = payload["tzolkin"]
-    moon = payload["moon"]
-    cls = payload["class"]
-    crowd = payload["crowd"]
-    bot_mode = payload["bot_mode"]
-    bior = payload["biorhythms"]
+def format_day_report(day_data: dict, include_training: bool = True) -> str:
+    d = day_data["date"]
+    info = day_data["info"]
+    moon = day_data["moon"]
+    cls = day_data["cls"]
+    crowd = day_data["crowd"]
+    bot_mode = day_data["bot_mode"]
+    bior = day_data["bior"]
+    training = day_data["training"]
 
     lines: list[str] = []
 
-    lines.append(f"📅 *День* {d}")
-    lines.append(f"Майя: *{tz['number']} {tz['name']}*")
-    lines.append(f"Луна: {moon['phase_name']}")
+    # Заголовок
+    lines.append(f"📅 *День* {d.isoformat()}")
+    lines.append(f"Майя: *{info['tz_number']} {info['tz_name']}*")
+    lines.append(f"Луна: *{moon['phase_name']}*")
     lines.append("")
+
+    # Класс дня и сигнал
     lines.append(f"Класс дня: *{cls['label']}*")
     lines.append(cls["description"])
     lines.append("")
     lines.append(f"Торговый сигнал: *{cls['trading_signal_label']}*")
     lines.append(cls["trading_signal_description"])
     lines.append("")
-    lines.append(f"Толпа: *{crowd['state_label']}* ({crowd['state']})")
-    lines.append(crowd["state_description"])
+
+    # Толпа и режим бота
+    lines.append(f"Толпа: *{crowd['state_label']}* ({crowd['code']})")
+    lines.append(crowd["description"])
     lines.append("")
     lines.append(f"Режим бота: *{bot_mode['label']}* ({bot_mode['code']})")
     lines.append(bot_mode["description"])
     lines.append("")
-    lines.append("📊 *Биоритмы* (в %):")
+
+    # Биоритмы
+    lines.append("📊 *Биоритмы (в %):*")
     lines.append(
-        f"Физический: {bior['physical']} | Эмоциональный: {bior['emotional']} | "
-        f"Интеллектуальный: {bior['intellectual']} | Духовный: {bior['spiritual']}"
+        f"Физический: {bior['physical']} | "
+        f"Эмоциональный: {bior['emotional']} | "
+        f"Интеллектуальный: {bior['intellectual']} | "
+        f"Духовный: {bior['spiritual']}"
     )
+
+    # Тренировка (по желанию)
+    if include_training:
+        lines.append("")
+        lines.append("🏃 *Тренировка 4 Muluk на день:*")
+        lines.append(f"Тип: *{training['type']}*")
+        lines.append(training["text"])
 
     return "\n".join(lines)
 
 
-# === ОБРАБОТЧИКИ КОМАНД ===
+# --- TELEGRAM-ХЕНДЛЕРЫ --- #
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "Привет! Я облачный бот *Системы 4 Muluk*.\n\n"
-        "Команды:\n"
-        "/day — энергетический отчёт на сегодня\n"
-        "/day YYYY-MM-DD — отчёт на конкретную дату\n\n"
-        "Бот работает в облаке 24/7, даже если твой компьютер выключен."
+        "Привет, Талгат! Я облачный бот Системы *4 Muluk* 🌊\n\n"
+        "Доступные команды:\n"
+        "/day — отчёт на сегодня\n"
+        "/day YYYY-MM-DD — отчёт на конкретную дату\n"
+        "/morning_test — показать, как будет выглядеть утренний отчёт\n\n"
+        "Утренний автоотчёт раз в сутки:\n"
+        "- время задаём в коде (сейчас 06:00 по Бишкеку)\n"
+        "- чат для автоотчёта — через переменную окружения OWNER_CHAT_ID."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
-    date_str = None
-    d: date
-
     if args:
+        # пытаемся разобрать дату из аргумента
         try:
             d = datetime.strptime(args[0], "%Y-%m-%d").date()
-            date_str = args[0]
         except ValueError:
             await update.message.reply_text(
                 "Дата должна быть в формате YYYY-MM-DD, пример:\n"
-                "/day 2025-11-30"
+                "`/day 2025-12-04`",
+                parse_mode="Markdown",
             )
             return
     else:
         d = date.today()
-        date_str = d.isoformat()
 
-    try:
-        payload = compute_day_payload(d)
-    except Exception as e:
-        logger.exception("Ошибка при расчёте дня %s: %s", date_str, e)
-        await update.message.reply_text("Не удалось посчитать энергетику дня. Попробуй позже.")
-        return
-
-    text = format_day_message(payload)
+    day_data = build_day_data(d)
+    text = format_day_report(day_data, include_training=True)
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# === MAIN ===
+async def morning_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ручной тест утреннего отчёта:
+    - берём сегодняшнюю дату
+    - считаем всё как для утра
+    - шлём в этот же чат
+    """
+    d = date.today()
+    day_data = build_day_data(d)
+    text = "🌅 *Утренний отчёт 4 Muluk (тест)*\n\n" + format_day_report(
+        day_data,
+        include_training=True,
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# --- УТРЕННЕЕ ЗАДАНИЕ ДЛЯ JOB QUEUE --- #
+
+async def morning_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Автоматический утренний отчёт (job_queue):
+    - срабатывает по времени (06:00 Asia/Bishkek)
+    - отправляет отчёт в OWNER_CHAT_ID (если задан)
+    """
+    if not OWNER_CHAT_ID:
+        logger.info("OWNER_CHAT_ID не задан, утренний отчёт пропущен.")
+        return
+
+    try:
+        chat_id = int(OWNER_CHAT_ID)
+    except ValueError:
+        logger.error("OWNER_CHAT_ID='%s' не удалось преобразовать в int", OWNER_CHAT_ID)
+        return
+
+    d = date.today()
+    day_data = build_day_data(d)
+    text = "🌅 *Утренний отчёт 4 Muluk*\n\n" + format_day_report(
+        day_data,
+        include_training=True,
+    )
+
+    logger.info("Отправляю утренний отчёт в чат %s", chat_id)
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
+
+# --- MAIN --- #
 
 def main():
-    # health-server запускаем в отдельном потоке
-    threading.Thread(target=run_health_server, daemon=True).start()
+    if not BOT_TOKEN:
+        print(
+            "Не найден токен бота. Установи переменную окружения "
+            "TELEGRAM_BOT_TOKEN или BOT_TOKEN или TOKEN."
+        )
+        return
 
-    # Telegram-бот в основном потоке: run_polling сам управляет event loop
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("day", day_cmd))
+    start_health_server()
 
     logger.info("Запускаю Telegram-бота 4 Muluk в облаке...")
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Команды
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("day", day_cmd))
+    app.add_handler(CommandHandler("morning_test", morning_test_cmd))
+
+    # Утренняя задача (каждый день в 06:00 по Бишкеку)
+    run_time = time(hour=6, minute=0, tzinfo=BISHKEK_TZ)
+    app.job_queue.run_daily(
+        morning_job,
+        time=run_time,
+        name="morning_report_4muluk",
+    )
+
+    # Запуск бота (polling)
     app.run_polling()
 
 
