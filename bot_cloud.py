@@ -20,6 +20,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
+import html
 
 from telegram import Update
 from telegram.ext import (
@@ -45,7 +46,6 @@ BIRTH_DATE = date(1972, 11, 10)
 try:
     BISHKEK_TZ = ZoneInfo("Asia/Bishkek")
 except Exception:
-    # Запасной вариант, если вдруг нет таймзоны в образе
     from datetime import timezone
     BISHKEK_TZ = timezone(timedelta(hours=6))
 
@@ -123,32 +123,40 @@ def format_day_report(day_data: dict, include_training: bool = True) -> str:
     bior = day_data["bior"]
     training = day_data["training"]
 
+    crowd_label = crowd.get("label") or crowd.get("state_label", "?")
+    crowd_desc = crowd.get("description") or crowd.get("state_description", "")
+    crowd_code = crowd.get("code", "?")
+
+    bot_label = bot_mode.get("label", "?")
+    bot_code = bot_mode.get("code", "?")
+    bot_desc = bot_mode.get("description", "")
+
     lines: list[str] = []
 
     # Заголовок
-    lines.append(f"📅 *День* {d.isoformat()}")
-    lines.append(f"Майя: *{info['tz_number']} {info['tz_name']}*")
-    lines.append(f"Луна: *{moon['phase_name']}*")
+    lines.append(f"📅 <b>День</b> {d.isoformat()}")
+    lines.append(f"Майя: <b>{html.escape(str(info['tz_number']))} {html.escape(info['tz_name'])}</b>")
+    lines.append(f"Луна: <b>{html.escape(moon['phase_name'])}</b>")
     lines.append("")
 
     # Класс дня и сигнал
-    lines.append(f"Класс дня: *{cls['label']}*")
-    lines.append(cls["description"])
+    lines.append(f"Класс дня: <b>{html.escape(cls['label'])}</b>")
+    lines.append(html.escape(cls["description"]))
     lines.append("")
-    lines.append(f"Торговый сигнал: *{cls['trading_signal_label']}*")
-    lines.append(cls["trading_signal_description"])
+    lines.append(f"Торговый сигнал: <b>{html.escape(cls['trading_signal_label'])}</b>")
+    lines.append(html.escape(cls["trading_signal_description"]))
     lines.append("")
 
     # Толпа и режим бота
-    lines.append(f"Толпа: *{crowd['state_label']}* ({crowd['code']})")
-    lines.append(crowd["description"])
+    lines.append(f"Толпа: <b>{html.escape(crowd_label)}</b> ({html.escape(crowd_code)})")
+    lines.append(html.escape(crowd_desc))
     lines.append("")
-    lines.append(f"Режим бота: *{bot_mode['label']}* ({bot_mode['code']})")
-    lines.append(bot_mode["description"])
+    lines.append(f"Режим бота: <b>{html.escape(bot_label)}</b> ({html.escape(bot_code)})")
+    lines.append(html.escape(bot_desc))
     lines.append("")
 
     # Биоритмы
-    lines.append("📊 *Биоритмы (в %):*")
+    lines.append("📊 <b>Биоритмы (в %):</b>")
     lines.append(
         f"Физический: {bior['physical']} | "
         f"Эмоциональный: {bior['emotional']} | "
@@ -159,9 +167,9 @@ def format_day_report(day_data: dict, include_training: bool = True) -> str:
     # Тренировка (по желанию)
     if include_training:
         lines.append("")
-        lines.append("🏃 *Тренировка 4 Muluk на день:*")
-        lines.append(f"Тип: *{training['type']}*")
-        lines.append(training["text"])
+        lines.append("🏃 <b>Тренировка 4 Muluk на день:</b>")
+        lines.append(f"Тип: <b>{html.escape(training['type'])}</b>")
+        lines.append(html.escape(training["text"]))
 
     return "\n".join(lines)
 
@@ -170,29 +178,28 @@ def format_day_report(day_data: dict, include_training: bool = True) -> str:
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "Привет, Талгат! Я облачный бот Системы *4 Muluk* 🌊\n\n"
+        "Привет, Талгат! Я облачный бот Системы <b>4 Muluk</b> 🌊\n\n"
         "Доступные команды:\n"
         "/day — отчёт на сегодня\n"
         "/day YYYY-MM-DD — отчёт на конкретную дату\n"
         "/morning_test — показать, как будет выглядеть утренний отчёт\n\n"
         "Утренний автоотчёт раз в сутки:\n"
-        "- время задаём в коде (по умолчанию 06:00 по Бишкеку)\n"
-        "- чат для автоотчёта — через переменную окружения OWNER_CHAT_ID."
+        "- время задаётся в коде (по умолчанию 06:00 по Бишкеку)\n"
+        "- чат для автоотчёта — через переменную окружения <b>OWNER_CHAT_ID</b>."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if args:
-        # пытаемся разобрать дату из аргумента
         try:
             d = datetime.strptime(args[0], "%Y-%m-%d").date()
         except ValueError:
             await update.message.reply_text(
                 "Дата должна быть в формате YYYY-MM-DD, пример:\n"
-                "`/day 2025-12-04`",
-                parse_mode="Markdown",
+                "/day 2025-12-04",
+                parse_mode="HTML",
             )
             return
     else:
@@ -200,7 +207,7 @@ async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     day_data = build_day_data(d)
     text = format_day_report(day_data, include_training=True)
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def morning_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -212,11 +219,11 @@ async def morning_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     d = date.today()
     day_data = build_day_data(d)
-    text = "🌅 *Утренний отчёт 4 Muluk (тест)*\n\n" + format_day_report(
+    text = "🌅 <b>Утренний отчёт 4 Muluk (тест)</b>\n\n" + format_day_report(
         day_data,
         include_training=True,
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 # --- УТРЕННЕЕ ЗАДАНИЕ ДЛЯ JOB QUEUE (если доступен) --- #
@@ -239,13 +246,13 @@ async def morning_job(context: ContextTypes.DEFAULT_TYPE):
 
     d = date.today()
     day_data = build_day_data(d)
-    text = "🌅 *Утренний отчёт 4 Muluk*\n\n" + format_day_report(
+    text = "🌅 <b>Утренний отчёт 4 Muluk</b>\n\n" + format_day_report(
         day_data,
         include_training=True,
     )
 
     logger.info("Отправляю утренний отчёт в чат %s", chat_id)
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 
 # --- MAIN --- #
